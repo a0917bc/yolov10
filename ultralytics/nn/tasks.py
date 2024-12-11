@@ -6,7 +6,8 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-
+from ultralytics.nn.modules.dev import InvertedResidual, conv_3x3_bn, conv_1x1_bn, ConvBNReLU, InvertedResidualalcor, Graystem
+from ultralytics.nn.modules.egis_dev import GatedCNNBlock, DWStemLayer, DWDownsampleLayer, DWConvbnrelu, DWgrayStemLayer
 from ultralytics.nn.modules import (
     AIFI,
     C1,
@@ -53,11 +54,12 @@ from ultralytics.nn.modules import (
     PSA,
     SCDown,
     RepVGGDW,
-    v10Detect
+    v10Detect,
+    EgisDetect
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
-from ultralytics.utils.loss import v8ClassificationLoss, v8DetectionLoss, v8OBBLoss, v8PoseLoss, v8SegmentationLoss, v10DetectLoss
+from ultralytics.utils.loss import v8ClassificationLoss, v8DetectionLoss, v8OBBLoss, v10PoseLoss, v8SegmentationLoss, v10DetectLoss
 from ultralytics.utils.plotting import feature_visualization
 from ultralytics.utils.torch_utils import (
     fuse_conv_and_bn,
@@ -75,10 +77,12 @@ try:
 except ImportError:
     thop = None
 
+DEV=(GatedCNNBlock, DWStemLayer, DWDownsampleLayer, DWConvbnrelu, InvertedResidual, conv_3x3_bn, conv_1x1_bn, ConvBNReLU, InvertedResidualalcor, DWgrayStemLayer, Graystem)
+
 
 class BaseModel(nn.Module):
     """The BaseModel class serves as a base class for all the models in the Ultralytics YOLO family."""
-
+    
     def forward(self, x, *args, **kwargs):
         """
         Forward pass of the model on a single scale. Wrapper for `_forward_once` method.
@@ -183,7 +187,7 @@ class BaseModel(nn.Module):
         """
         if not self.is_fused():
             for m in self.model.modules():
-                if isinstance(m, (Conv, Conv2, DWConv)) and hasattr(m, "bn"):
+                if isinstance(m, (Conv, Conv2, DWConv, GatedCNNBlock)) and hasattr(m, "bn"):
                     if isinstance(m, Conv2):
                         m.fuse_convs()
                     m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
@@ -193,6 +197,63 @@ class BaseModel(nn.Module):
                     m.conv_transpose = fuse_deconv_and_bn(m.conv_transpose, m.bn)
                     delattr(m, "bn")  # remove batchnorm
                     m.forward = m.forward_fuse  # update forward
+                #if isinstance(m, (conv_3x3_bn, conv_1x1_bn)) and len(m) != 3:
+                #    m[0] = fuse_conv_and_bn(m[0], m[1])
+                #    del m[1]
+                if isinstance(m, InvertedResidual):
+                    if len(m.conv) == 5:
+                        m.conv[3] = fuse_conv_and_bn(m.conv[3], m.conv[4])
+                        del m.conv[4]
+                        m.conv[0] = fuse_conv_and_bn(m.conv[0], m.conv[1])
+                        del m.conv[1]
+                    elif len(m.conv) == 8:
+                        m.conv[6] = fuse_conv_and_bn(m.conv[6], m.conv[7])
+                        del m.conv[7]
+                        m.conv[3] = fuse_conv_and_bn(m.conv[3], m.conv[4])
+                        del m.conv[4]
+                        m.conv[0] = fuse_conv_and_bn(m.conv[0], m.conv[1])
+                        del m.conv[1]
+                #if isinstance(m, DWgrayStemLayer):
+                if isinstance(m, Graystem):
+                    if len(m.conv) == 3:
+                        m.conv[0] = fuse_conv_and_bn(m.conv[0], m.conv[1])
+                        del m.conv[1]
+                if isinstance(m, ConvBNReLU):
+                    if len(m) == 3:
+                        torch.ao.quantization.fuse_modules_qat(m, ['0', '1', '2'], inplace=True)
+                    else:
+                        torch.ao.quantization.fuse_modules_qat(m, ['1', '2', '3'], inplace=True)
+                    """
+                    if len(m) == 3:
+                        m[0] = fuse_conv_and_bn(m[0], m[1])
+                        del m[1]
+                    if len(m) == 4:
+                        m[1] = fuse_conv_and_bn(m[1], m[2])
+                        del m[2]"""
+                if isinstance(m, (DWStemLayer, DWgrayStemLayer)):
+                    if isinstance(m.norm1, nn.BatchNorm2d):
+                        m.conv1[-1] = fuse_conv_and_bn(m.conv1[-1], m.norm1)
+                        m.conv2[-1] = fuse_conv_and_bn(m.conv2[-1], m.norm2)
+                        m.norm1 = nn.Identity()
+                        m.norm2 = nn.Identity()
+                if isinstance(m, DWDownsampleLayer):
+                    if isinstance(m.norm, nn.BatchNorm2d):
+                        m.conv[-1] = fuse_conv_and_bn(m.conv[-1], m.norm)
+                        m.norm = nn.Identity()
+                if isinstance(m, DWConvbnrelu):
+                    torch.ao.quantization.fuse_modules_qat(m.conv, ['1', '2', '3'], inplace=True)
+                    
+                if isinstance(m, InvertedResidualalcor):
+                    for idx in range(len(m.conv)):
+                        if type(m.conv[idx]) == nn.Conv2d:
+                            torch.ao.quantization.fuse_modules_qat(m.conv, [str(idx), str(idx + 1)], inplace=True)
+                    """
+                    if len(m.conv) == 3:
+                        m.conv[1] = fuse_conv_and_bn(m.conv[1], m.conv[2])
+                        del m.conv[2]
+                    elif len(m.conv) == 4:
+                        m.conv[2] = fuse_conv_and_bn(m.conv[2], m.conv[3])
+                        del m.conv[3]"""
                 if isinstance(m, RepConv):
                     m.fuse_convs()
                     m.forward = m.forward_fuse  # update forward
@@ -302,7 +363,7 @@ class DetectionModel(BaseModel):
             s = 256  # 2x min stride
             m.inplace = self.inplace
             forward = lambda x: self.forward(x)[0] if isinstance(m, (Segment, Pose, OBB)) else self.forward(x)
-            if isinstance(m, v10Detect):
+            if isinstance(m, (v10Detect, EgisDetect)):
                 forward = lambda x: self.forward(x)["one2many"]
             m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
             self.stride = m.stride
@@ -399,7 +460,7 @@ class PoseModel(DetectionModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
-        return v8PoseLoss(self)
+        return v10PoseLoss(self)
 
 
 class ClassificationModel(BaseModel):
@@ -888,8 +949,10 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             RepC3,
             PSA,
             SCDown,
-            C2fCIB
-        }:
+            C2fCIB,
+            InvertedResidual, 
+            conv_3x3_bn, 
+            conv_1x1_bn}:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
@@ -898,8 +961,8 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 args[2] = int(
                     max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2]
                 )  # num heads
-
-            args = [c1, c2, *args[1:]]
+            if m not in DEV:
+                args = [c1, c2, *args[1:]]
             if m in (BottleneckCSP, C1, C2, C2f, C2fAttn, C3, C3TR, C3Ghost, C3x, RepC3, C2fCIB):
                 args.insert(2, n)  # number of repeats
                 n = 1
@@ -917,7 +980,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}:
+        elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect, EgisDetect}:
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
@@ -932,6 +995,10 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         else:
             c2 = ch[f]
 
+        if m in DEV:
+            c2 = args[1]
+            if m == GatedCNNBlock:
+                c2 = args[0]
         m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         t = str(m)[8:-2].replace("__main__.", "")  # module type
         m.np = sum(x.numel() for x in m_.parameters())  # number params
@@ -1005,7 +1072,7 @@ def guess_model_task(model):
         m = cfg["head"][-1][-2].lower()  # output module name
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
-        if m == "detect" or m == "v10detect":
+        if m == "detect" or m == "v10detect" or m=="egisdetect":
             return "detect"
         if m == "segment":
             return "segment"
@@ -1037,7 +1104,7 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
-            elif isinstance(m, (Detect, WorldDetect, v10Detect)):
+            elif isinstance(m, (Detect, WorldDetect, v10Detect, EgisDetect)):
                 return "detect"
 
     # Guess from model filename

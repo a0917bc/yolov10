@@ -146,6 +146,22 @@ class AutoBackend(nn.Module):
             stride = max(int(model.stride.max()), 32)  # model stride
             names = model.module.names if hasattr(model, "module") else model.names  # get class names
             model.half() if fp16 else model.float()
+            """QUANT
+            from ultralytics.engine.trainer import CUSTOM_QCFG
+            from datetime import datetime
+            model.model.qconfig = CUSTOM_QCFG
+            print(model.model.qconfig)
+            model.train()
+            torch.quantization.prepare_qat(model.model, inplace=True)
+            ptname = 'ptq%s.pt'%datetime.now().strftime("%Y%m%d")
+            #ptname = 'qat%s.pt'%datetime.now().strftime("%Y%m%d")
+            #ptname = 'qat20241025.pt'
+            print('Evaluating ', ptname)
+            wgt = torch.load(ptname, map_location=torch.device('cpu'))
+            model.model.load_state_dict(wgt)
+            model.eval()
+            torch.quantization.convert(model.model, inplace=True)
+            print(model.model)"""
             self.model = model  # explicitly assign for to(), cpu(), cuda(), half()
             pt = True
 

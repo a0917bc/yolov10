@@ -304,15 +304,19 @@ def convert_coco(
                         )
 
             # Write
-            with open((fn / f).with_suffix(".txt"), "a") as file:
-                for i in range(len(bboxes)):
-                    if use_keypoints:
-                        line = (*(keypoints[i]),)  # cls, box, keypoints
-                    else:
-                        line = (
-                            *(segments[i] if use_segments and len(segments[i]) > 0 else bboxes[i]),
-                        )  # cls, box or segments
-                    file.write(("%g " * len(line)).rstrip() % line + "\n")
+            try:
+                with open((fn / f).with_suffix(".txt"), "a") as file:
+                    for i in range(len(bboxes)):
+                        if use_keypoints:
+                            line = (*(keypoints[i]),)  # cls, box, keypoints
+                        else:
+                            line = (
+                                *(segments[i] if use_segments and len(segments[i]) > 0 else bboxes[i]),
+                            )  # cls, box or segments
+                        file.write(("%g " * len(line)).rstrip() % line + "\n")
+            except:
+                print(fn)
+                print(f)
 
     LOGGER.info(f"COCO data converted successfully.\nResults saved to {save_dir.resolve()}")
 

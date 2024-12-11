@@ -849,6 +849,7 @@ def clean_str(s):
     return re.sub(pattern="[|@#!¡·$€%&()=?¿^*;:,¨´><+]", repl="_", string=s)
 
 def v10postprocess(preds, max_det, nc=80):
+    preds = preds[..., :4+nc]
     assert(4 + nc == preds.shape[-1])
     boxes, scores = preds.split([4, nc], dim=-1)
     max_scores = scores.amax(dim=-1)

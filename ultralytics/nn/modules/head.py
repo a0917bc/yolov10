@@ -9,6 +9,8 @@ from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 from .block import DFL, Proto, ContrastiveHead, BNContrastiveHead
+from .egis_dev import DWConvbnrelu
+from .dev import InvertedResidualalcor
 from .conv import Conv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
@@ -32,7 +34,7 @@ class Detect(nn.Module):
         super().__init__()
         self.nc = nc  # number of classes
         self.nl = len(ch)  # number of detection layers
-        self.reg_max = 16  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
+        self.reg_max = 1  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
         self.no = nc + self.reg_max * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
@@ -41,6 +43,7 @@ class Detect(nn.Module):
         )
         self.cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
+        self.dequant = torch.quantization.DeQuantStub()
 
     def inference(self, x):
         # Inference path
@@ -56,6 +59,8 @@ class Detect(nn.Module):
         else:
             box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
 
+        #cls = self.dequant(cls)
+        #box = self.dequant(box)
         if self.export and self.format in ("tflite", "edgetpu"):
             # Precompute normalization factor to increase numerical stability
             # See https://github.com/ultralytics/ultralytics/issues/7371
@@ -66,14 +71,23 @@ class Detect(nn.Module):
             dbox = self.decode_bboxes(self.dfl(box) * norm, self.anchors.unsqueeze(0) * norm[:, :2])
         else:
             dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
-
+        
+        
         y = torch.cat((dbox, cls.sigmoid()), 1)
         return y if self.export else (y, x)
 
     def forward_feat(self, x, cv2, cv3):
         y = []
         for i in range(self.nl):
-            y.append(torch.cat((cv2[i](x[i]), cv3[i](x[i])), 1))
+            y.append(
+                torch.cat(
+                    (
+                        self.dequant(cv2[i](x[i])), 
+                        self.dequant(cv3[i](x[i]))
+                    ), 
+                    1
+                )
+            )
         return y
 
     def forward(self, x):
@@ -158,45 +172,7 @@ class OBB(Detect):
         return dist2rbox(bboxes, self.angle, anchors, dim=1)
 
 
-class Pose(Detect):
-    """YOLOv8 Pose head for keypoints models."""
 
-    def __init__(self, nc=80, kpt_shape=(17, 3), ch=()):
-        """Initialize YOLO network with default parameters and Convolutional Layers."""
-        super().__init__(nc, ch)
-        self.kpt_shape = kpt_shape  # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
-        self.nk = kpt_shape[0] * kpt_shape[1]  # number of keypoints total
-        self.detect = Detect.forward
-
-        c4 = max(ch[0] // 4, self.nk)
-        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nk, 1)) for x in ch)
-
-    def forward(self, x):
-        """Perform forward pass through YOLO model and return predictions."""
-        bs = x[0].shape[0]  # batch size
-        kpt = torch.cat([self.cv4[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)  # (bs, 17*3, h*w)
-        x = self.detect(self, x)
-        if self.training:
-            return x, kpt
-        pred_kpt = self.kpts_decode(bs, kpt)
-        return torch.cat([x, pred_kpt], 1) if self.export else (torch.cat([x[0], pred_kpt], 1), (x[1], kpt))
-
-    def kpts_decode(self, bs, kpts):
-        """Decodes keypoints."""
-        ndim = self.kpt_shape[1]
-        if self.export:  # required for TFLite export to avoid 'PLACEHOLDER_FOR_GREATER_OP_CODES' bug
-            y = kpts.view(bs, *self.kpt_shape, -1)
-            a = (y[:, :, :2] * 2.0 + (self.anchors - 0.5)) * self.strides
-            if ndim == 3:
-                a = torch.cat((a, y[:, :, 2:3].sigmoid()), 2)
-            return a.view(bs, self.nk, -1)
-        else:
-            y = kpts.clone()
-            if ndim == 3:
-                y[:, 2::3] = y[:, 2::3].sigmoid()  # sigmoid (WARNING: inplace .sigmoid_() Apple MPS bug)
-            y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
-            y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
-            return y
 
 
 class Classify(nn.Module):
@@ -501,9 +477,20 @@ class v10Detect(Detect):
     def __init__(self, nc=80, ch=()):
         super().__init__(nc, ch)
         c3 = max(ch[0], min(self.nc, 100))  # channels
-        self.cv3 = nn.ModuleList(nn.Sequential(nn.Sequential(Conv(x, x, 3, g=x), Conv(x, c3, 1)), \
-                                               nn.Sequential(Conv(c3, c3, 3, g=c3), Conv(c3, c3, 1)), \
-                                                nn.Conv2d(c3, self.nc, 1)) for i, x in enumerate(ch))
+        
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(
+                nn.Sequential(
+                    Conv(x, x, 3, g=x), 
+                    Conv(x, c3, 1)
+                ),
+                nn.Sequential(
+                    Conv(c3, c3, 3, g=c3), 
+                    Conv(c3, c3, 1)
+                ), 
+                nn.Conv2d(c3, self.nc, 1)
+            ) for _, x in enumerate(ch)
+        )
 
         self.one2one_cv2 = copy.deepcopy(self.cv2)
         self.one2one_cv3 = copy.deepcopy(self.cv3)
@@ -533,3 +520,107 @@ class v10Detect(Detect):
         for a, b, s in zip(m.one2one_cv2, m.one2one_cv3, m.stride):  # from
             a[-1].bias.data[:] = 1.0  # box
             b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+
+
+
+class EgisDetect(Detect):
+
+    max_det = 300
+
+    def __init__(self, nc=80, ch=()):
+        super().__init__(nc, ch)
+        kernel_size=3
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(
+                DWConvbnrelu(x, ch[0], kernel_size),
+                DWConvbnrelu(ch[0], ch[0], kernel_size), 
+                nn.Conv2d(ch[0], self.nc, 1)
+            ) for x in ch
+        )
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(
+                DWConvbnrelu(x, ch[0], kernel_size),
+                DWConvbnrelu(ch[0], ch[0], kernel_size), 
+                nn.Conv2d(ch[0], 4 * self.reg_max, 1)
+            ) for x in ch
+        )
+        self.one2one_cv2 = copy.deepcopy(self.cv2)
+        self.one2one_cv3 = copy.deepcopy(self.cv3)
+        
+    def forward(self, x):
+        one2one = self.forward_feat([xi.detach() for xi in x], self.one2one_cv2, self.one2one_cv3)
+        if not self.export:
+            one2many = super().forward(x)
+        
+        if not self.training:
+            one2one = self.inference(one2one)
+            if not self.export:
+                return {"one2many": one2many, "one2one": one2one}
+            else:
+                assert(self.max_det != -1)
+                boxes, scores, labels = ops.v10postprocess(one2one.permute(0, 2, 1), self.max_det, self.nc)
+                return torch.cat([boxes, scores.unsqueeze(-1), labels.unsqueeze(-1).to(boxes.dtype)], dim=-1)
+        else:
+            return {"one2many": one2many, "one2one": one2one}
+
+    def bias_init(self):
+        """Initialize Detect() biases, WARNING: requires stride availability."""
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.one2one_cv2, m.one2one_cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+
+class Pose(EgisDetect):
+    """YOLOv8 Pose head for keypoints models."""
+
+    def __init__(self, nc=80, kpt_shape=(17, 3), ch=()):
+        """Initialize YOLO network with default parameters and Convolutional Layers."""
+        super().__init__(nc, ch)
+        self.kpt_shape = kpt_shape  # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
+        self.nk = kpt_shape[0] * kpt_shape[1]  # number of keypoints total
+        self.detect = EgisDetect.forward
+
+        c4 = max(ch[0] // 4, self.nk)
+        #self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nk, 1)) for x in ch)
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(
+                DWConvbnrelu(x, c4, 3),
+                DWConvbnrelu(c4, c4, 3), 
+                nn.Conv2d(c4, self.nk, 1)
+            ) for x in ch
+        )
+        self.one2one_cv4 = copy.deepcopy(self.cv4)
+
+    def forward(self, x):
+        """Perform forward pass through YOLO model and return predictions."""
+        bs = x[0].shape[0]  # batch size
+        kpt = torch.cat([self.dequant(self.cv4[i](x[i])).view(bs, self.nk, -1) for i in range(self.nl)], -1)  # (bs, 17*3, h*w)
+        kpt_one2one = torch.cat([self.dequant(self.one2one_cv4[i](x[i])).view(bs, self.nk, -1) for i in range(self.nl)], -1)
+
+        x = self.detect(self, x)
+        x["one2many_kpt"] = kpt
+        x["one2one_kpt"] = kpt_one2one
+        if self.training:
+            return x
+        pred_kpt = self.kpts_decode(bs, kpt)
+        pred_kpt_one2one = self.kpts_decode(bs, kpt_one2one)
+        return (torch.cat([x["one2many"][0], pred_kpt], 1), (x["one2many"][1], kpt))
+
+    def kpts_decode(self, bs, kpts):
+        """Decodes keypoints."""
+        ndim = self.kpt_shape[1]
+        if self.export:  # required for TFLite export to avoid 'PLACEHOLDER_FOR_GREATER_OP_CODES' bug
+            y = kpts.view(bs, *self.kpt_shape, -1)
+            a = (y[:, :, :2] * 2.0 + (self.anchors - 0.5)) * self.strides
+            if ndim == 3:
+                a = torch.cat((a, y[:, :, 2:3].sigmoid()), 2)
+            return a.view(bs, self.nk, -1)
+        else:
+            y = kpts.clone()
+            if ndim == 3:
+                y[:, 2::3] = y[:, 2::3].sigmoid()  # sigmoid (WARNING: inplace .sigmoid_() Apple MPS bug)
+            y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
+            y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
+            return y

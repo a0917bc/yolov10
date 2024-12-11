@@ -327,7 +327,9 @@ class Concat(nn.Module):
         """Concatenates a list of tensors along a specified dimension."""
         super().__init__()
         self.d = dimension
+        self.qf = nn.quantized.FloatFunctional()
 
     def forward(self, x):
         """Forward pass for the YOLOv8 mask Proto module."""
-        return torch.cat(x, self.d)
+        #return torch.cat(x, self.d)
+        return self.qf.cat(x, self.d)

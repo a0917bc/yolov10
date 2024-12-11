@@ -1,0 +1,29 @@
+# Parameters
+nc: 1 # number of classes
+
+# YOLOv8.0n backbone
+backbone:
+  - [-1, 1, DWgrayStemLayer, [1, 16, False]] #0/P1
+  - [-1, 1, GatedCNNBlock, [16, 2, 3, 1.0, 0]] #1
+  - [-1, 1, GatedCNNBlock, [16, 4, 3, 1.0, 0.001]] #2
+  - [-1, 1, DWDownsampleLayer, [16, 24, False]] #3/P2
+  - [-1, 1, GatedCNNBlock, [24, 2, 3, 1.0, 0.002]] #4
+  - [-1, 1, GatedCNNBlock, [24, 4, 3, 1.0, 0.003]] #5
+  - [-1, 1, DWDownsampleLayer, [24, 48, False]] #6/P3
+  - [-1, 1, GatedCNNBlock, [48, 2, 3, 1.0, 0.004]] #7
+  - [-1, 1, GatedCNNBlock, [48, 2, 3, 1.0, 0.005]] #8
+  - [-1, 1, GatedCNNBlock, [48, 4, 3, 1.0, 0.006]] #9
+  - [-1, 1, DWDownsampleLayer, [48, 24, False]] #10/P4
+  - [-1, 1, GatedCNNBlock, [24, 4, 7, 1.0, 0.007]] #11
+
+# YOLOv8.0n head
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 9], 1, Concat, [1]] # cat backbone P4
+  - [-1, 1, GatedCNNBlock, [72, 2, 7, 1]] # 14
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 5], 1, Concat, [1]] # cat backbone P3
+  - [-1, 1, GatedCNNBlock, [96, 2, 7, 1]] # 17 (P3/8-small)
+
+  - [[11, 14, 17], 1, EgisDetect, [nc, 7]] # Detect(P3, P4, P5)

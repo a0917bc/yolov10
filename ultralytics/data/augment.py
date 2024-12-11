@@ -947,10 +947,55 @@ class Format:
             labels["batch_idx"] = torch.zeros(nl)
         return labels
 
+    def yuv(self, img, format='422'):
+        b, g, r = cv2.split(img.astype(float))
+        height, width = r.shape
+
+        # Compute Y, U, V according to the formula described here:
+        # https://developer.apple.com/documentation/accelerate/conversion/understanding_ypcbcr_image_formats
+        # U applies Cb, and V applies Cr
+
+        # Use BT.709 standard "full range" conversion formula
+        y = 0.2126*r + 0.7152*g + 0.0722*b
+        u = 0.5389*(b-y) + 128
+        v = 0.6350*(r-y) + 128
+
+        # Downsample horizontally
+        if format == '422':
+            u = cv2.resize(u, (width//2, height), interpolation=cv2.INTER_LINEAR) 
+            v = cv2.resize(v, (width//2, height), interpolation=cv2.INTER_LINEAR) 
+
+        if format == '420':
+            u = u[::2, ::2]
+            v = v[::2, ::2]
+
+        # Convert 
+        y = np.round(y).astype(np.uint8)
+        u = np.round(np.clip(u, 0, 255)).astype(np.uint8)
+        v = np.round(np.clip(v, 0, 255)).astype(np.uint8)
+
+        # Interleave u and v:
+        if format == '422':
+            uv = np.zeros_like(y)
+            uv[:, 0::2] = u
+            uv[:, 1::2] = v
+
+        if format == '420':
+            uv = np.zeros((height//2, width), dtype=np.uint8)
+            uv[:, 0::2] = u
+            uv[:, 1::2] = v
+            uv = cv2.resize(uv, (width, height), interpolation=cv2.INTER_NEAREST) 
+
+        # Merge y and uv channels
+        img = cv2.merge((y, uv))
+        return img
+
     def _format_img(self, img):
         """Format the image for YOLO from Numpy array to PyTorch tensor."""
         if len(img.shape) < 3:
             img = np.expand_dims(img, -1)
+
+        #img = self.yuv(img)
         img = img.transpose(2, 0, 1)
         img = np.ascontiguousarray(img[::-1] if random.uniform(0, 1) > self.bgr else img)
         img = torch.from_numpy(img)

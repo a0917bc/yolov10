@@ -48,7 +48,332 @@ from ultralytics.utils.torch_utils import (
     select_device,
     strip_optimizer,
 )
+from datetime import datetime
 
+class LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
+    r"""This is an extension of the FakeQuantize module in fake_quantize.py, which
+    supports more generalized lower-bit quantization and support learning of the scale
+    and zero point parameters through backpropagation. For literature references,
+    please see the class _LearnableFakeQuantizePerTensorOp.
+
+    In addition to the attributes in the original FakeQuantize module, the _LearnableFakeQuantize
+    module also includes the following attributes to support quantization parameter learning.
+
+    * :attr:`channel_len` defines the length of the channel when initializing scale and zero point
+      for the per channel case.
+
+    * :attr:`use_grad_scaling` defines the flag for whether the gradients for scale and zero point are
+      normalized by the constant, which is proportional to the square root of the number of
+      elements in the tensor. The related literature justifying the use of this particular constant
+      can be found here: https://openreview.net/pdf?id=rkgO66VKDS.
+
+    * :attr:`fake_quant_enabled` defines the flag for enabling fake quantization on the output.
+
+    * :attr:`static_enabled` defines the flag for using observer's static estimation for
+      scale and zero point.
+
+    * :attr:`learning_enabled` defines the flag for enabling backpropagation for scale and zero point.
+    """
+
+    def __init__(
+        self,
+        observer,
+        quant_min=0,
+        quant_max=255,
+        scale=1.0,
+        zero_point=0.0,
+        channel_len=-1,
+        use_grad_scaling=False,
+        **observer_kwargs,
+    ):
+        super().__init__()
+        assert quant_min < quant_max, 'quant_min must be strictly less than quant_max.'
+        self.quant_min = quant_min
+        self.quant_max = quant_max
+        # also pass quant_min and quant_max to observer
+        observer_kwargs["quant_min"] = quant_min
+        observer_kwargs["quant_max"] = quant_max
+        self.use_grad_scaling = use_grad_scaling
+        if channel_len == -1:
+            self.scale = torch.nn.Parameter(torch.tensor([scale]))
+            self.zero_point = torch.nn.Parameter(torch.tensor([zero_point]))
+        else:
+            assert (isinstance(channel_len, int) and channel_len > 0), "Channel size must be a positive integer."
+            self.scale = torch.nn.Parameter(torch.tensor([scale] * channel_len))
+            self.zero_point = torch.nn.Parameter(torch.tensor([zero_point] * channel_len))
+
+        self.activation_post_process = observer(**observer_kwargs)
+        assert (torch.iinfo(self.activation_post_process.dtype).min <= quant_min), 'quant_min out of bound'
+        assert (quant_max <= torch.iinfo(self.activation_post_process.dtype).max), 'quant_max out of bound'
+        self.dtype = self.activation_post_process.dtype
+        self.qscheme = self.activation_post_process.qscheme
+        self.ch_axis = (
+            self.activation_post_process.ch_axis
+            if hasattr(self.activation_post_process, 'ch_axis')
+            else -1
+        )
+        self.register_buffer('fake_quant_enabled', torch.tensor([1], dtype=torch.uint8))
+        self.register_buffer('static_enabled', torch.tensor([1], dtype=torch.uint8))
+        self.register_buffer('learning_enabled', torch.tensor([0], dtype=torch.uint8))
+
+        bitrange = torch.tensor(quant_max - quant_min + 1).double()
+        self.bitwidth = int(torch.log2(bitrange).item())
+        self.register_buffer('eps', torch.tensor([torch.finfo(torch.float32).eps]))
+
+    @torch.jit.export
+    def enable_param_learning(self):
+        r"""Enables learning of quantization parameters and
+        disables static observer estimates. Forward path returns fake quantized X.
+        """
+        self.toggle_qparam_learning(enabled=True).toggle_fake_quant(
+            enabled=True
+        ).toggle_observer_update(enabled=False)
+        return self
+
+    @torch.jit.export
+    def enable_static_estimate(self):
+        r"""Enables static observer estimates and disbales learning of
+        quantization parameters. Forward path returns fake quantized X.
+        """
+        self.toggle_qparam_learning(enabled=False).toggle_fake_quant(
+            enabled=True
+        ).toggle_observer_update(enabled=True)
+
+    @torch.jit.export
+    def enable_static_observation(self):
+        r"""Enables static observer accumulating data from input but doesn't
+        update the quantization parameters. Forward path returns the original X.
+        """
+        self.toggle_qparam_learning(enabled=False).toggle_fake_quant(
+            enabled=False
+        ).toggle_observer_update(enabled=True)
+
+    @torch.jit.export
+    def toggle_observer_update(self, enabled=True):
+        self.static_enabled[0] = int(enabled)  # type: ignore[operator]
+        return self
+
+    @torch.jit.export
+    def enable_observer(self, enabled=True):
+        self.toggle_observer_update(enabled)
+
+    @torch.jit.export
+    def toggle_qparam_learning(self, enabled=True):
+        self.learning_enabled[0] = int(enabled)  # type: ignore[operator]
+        self.scale.requires_grad = enabled
+        self.zero_point.requires_grad = enabled
+        return self
+
+    @torch.jit.export
+    def toggle_fake_quant(self, enabled=True):
+        self.fake_quant_enabled[0] = int(enabled)
+        return self
+
+    @torch.jit.export
+    def observe_quant_params(self):
+        print('_LearnableFakeQuantize Scale: {}'.format(self.scale.detach()))
+        print('_LearnableFakeQuantize Zero Point: {}'.format(self.zero_point.detach()))
+
+    @torch.jit.export
+    def calculate_qparams(self):
+        self.scale.data.clamp_(min=self.eps.item())  # type: ignore[operator]
+        scale = self.scale.detach()
+        zero_point = (
+            self.zero_point.detach()
+            .round()
+            .clamp(self.quant_min, self.quant_max)
+            .long()
+        )
+        return scale, zero_point
+
+    @torch.jit.export
+    def extra_repr(self):
+        return (
+            f'fake_quant_enabled={self.fake_quant_enabled.item()}, observer_enabled={self.static_enabled.item()}, '
+            f'quant_min={self.quant_min}, quant_max={self.quant_max}, dtype={self.dtype}, qscheme={self.qscheme}, '
+            f'ch_axis={self.ch_axis}, '
+            f'scale={self.scale.item() if self.ch_axis == -1 else f"List[{self.scale.shape}]"}, '
+            f'zero_point={self.zero_point if self.ch_axis == -1 else "List"}'
+        )
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        if self.static_enabled[0] == 1:  # type: ignore[index]
+            self.activation_post_process(X.detach())
+            _scale, _zero_point = self.activation_post_process.calculate_qparams()
+            _scale, _zero_point = _scale.to(self.scale.device), _zero_point.to(self.zero_point.device)
+            self.scale.data.copy_(_scale)
+            self.zero_point.data.copy_(_zero_point)
+        else:
+            self.scale.data.clamp_(min=self.eps.item())  # type: ignore[operator]
+
+        if self.fake_quant_enabled[0] == 1:
+            # X = X.float()  # fake_quantize_learnable do not support AMP
+            if self.qscheme in (
+                torch.per_channel_symmetric,
+                torch.per_tensor_symmetric,
+            ):
+                self.zero_point.data.zero_()
+
+            if self.use_grad_scaling:
+                grad_factor = 1.0 / (X.numel() * self.quant_max) ** 0.5
+            else:
+                grad_factor = 1.0
+            if self.qscheme in (torch.per_channel_symmetric, torch.per_channel_affine):
+                X = torch._fake_quantize_learnable_per_channel_affine(
+                    X,
+                    self.scale,
+                    self.zero_point,
+                    self.ch_axis,
+                    self.quant_min,
+                    self.quant_max,
+                    grad_factor,
+                )
+
+            else:
+                X = torch._fake_quantize_learnable_per_tensor_affine(
+                    X,
+                    self.scale,
+                    self.zero_point,
+                    self.quant_min,
+                    self.quant_max,
+                    grad_factor,
+                )
+        return X
+    
+# Define custom QConfig with the custom observers
+from torch.ao.quantization.observer import _ObserverBase
+
+class MSEObserver(_ObserverBase):
+    '''
+    Calculate mseobserver of whole calibration dataset.
+    '''
+    min_val: torch.Tensor
+    max_val: torch.Tensor
+    p: float
+    def __init__(
+        self,
+        dtype=torch.quint8,
+        qscheme=torch.per_tensor_affine,
+        reduce_range=False,
+        quant_min=None,
+        quant_max=None,
+        pot_scale=False,
+        p=2.0,
+        # is_dynamic=False,
+        factory_kwargs=None,
+    ):
+        super(MSEObserver, self).__init__(
+            dtype=dtype,
+            qscheme=qscheme,
+            reduce_range=reduce_range,
+            quant_min=quant_min,
+            quant_max=quant_max,
+            # is_dynamic=is_dynamic,
+            factory_kwargs=factory_kwargs,
+        )
+        factory_kwargs = torch.nn.factory_kwargs(factory_kwargs)
+        self.register_buffer("min_val", torch.tensor(float("inf"), **factory_kwargs))
+        self.register_buffer("max_val", torch.tensor(float("-inf"), **factory_kwargs))
+        self.p = p
+        self.pot_scale = pot_scale
+
+    def lp_loss(self, pred, tgt, dim=None):
+        """
+        loss function measured in L_p Norm
+        """
+        return (pred - tgt).abs().pow(self.p).mean(dim) if dim else (pred - tgt).abs().pow(self.p).mean()
+
+    def mse(self, x: torch.Tensor, x_min: torch.Tensor, x_max: torch.Tensor, iter=80):
+        best_score = 1e+10
+        best_min, best_max = torch.tensor([1.0], dtype=torch.float), torch.tensor([1.0], dtype=torch.float)
+        best_min.copy_(x_min)
+        best_max.copy_(x_max)
+        # Pre-compute the step sizes
+        min_steps = x_min * torch.linspace(1, 1 - (iter - 1) * 0.01, iter, device=x.device)
+        max_steps = x_max * torch.linspace(1, 1 - (iter - 1) * 0.01, iter, device=x.device)
+        
+        # for i in range(iter):
+        for new_min, new_max in zip(min_steps, max_steps):
+            scale, zero_point = self._calculate_qparams(new_min, new_max)
+            x_q = torch.fake_quantize_per_tensor_affine(
+                x, scale.item(), int(zero_point.item()),
+                self.quant_min, self.quant_max)
+            score = self.lp_loss(x_q, x)
+            if score < best_score:
+                best_score = score
+                best_min, best_max = new_min, new_max
+        return best_min, best_max
+
+    def mse_perchannel(self, x: torch.Tensor, x_min: torch.Tensor, x_max: torch.Tensor, iter=80, ch_axis=0):
+        assert x_min.shape == x_max.shape
+        assert ch_axis >= 0, f'{ch_axis}'
+        best_score = 1e+10 * torch.ones_like(x_min)
+        best_min, best_max = x_min.clone(), x_max.clone()
+        reduce_dim = tuple([i for i in range(len(x.shape)) if i != ch_axis])
+        for i in range(iter):
+            new_min = x_min * (1.0 - (i * 0.01))
+            new_max = x_max * (1.0 - (i * 0.01))
+            scale, zero_point = self._calculate_qparams(new_min, new_max)
+            x_q = torch.fake_quantize_per_channel_affine(
+                x, scale, zero_point, ch_axis, 
+                self.quant_min, self.quant_max)
+            score = self.lp_loss(x_q, x, reduce_dim)
+            update_idx = (score < best_score)
+            best_score[update_idx] = score[update_idx]
+            best_min[update_idx] = new_min[update_idx]
+            best_max[update_idx] = new_max[update_idx]
+        return best_min, best_max
+
+    def forward(self, x_orig):
+        r"""Records the running minimum and maximum of ``x``."""
+        if x_orig.numel() == 0:
+            return x_orig
+        x = x_orig.clone().detach().to(self.min_val.dtype)
+
+        # min_val_cur, max_val_cur = torch._aminmax(x)
+        min_val_cur, max_val_cur = torch.aminmax(x)
+        min_val_cur, max_val_cur = self.mse(x, min_val_cur, max_val_cur, iter=95)
+
+        self.min_val = torch.min(self.min_val, min_val_cur)
+        self.max_val = torch.max(self.max_val, max_val_cur)
+        return x
+
+    @torch.jit.export
+    def calculate_qparams(self):
+        r"""Calculates the quantization parameters."""
+        return self._calculate_qparams(self.min_val, self.max_val)
+
+    @torch.jit.export
+    def extra_repr(self):
+        return f"min_val={self.min_val}, max_val={self.max_val}, p={self.p}"
+
+    @torch.jit.export
+    def reset_min_max_vals(self):
+        """Resets the min/max values."""
+        self.min_val = torch.tensor(float("inf"))
+        self.max_val = torch.tensor(float("-inf"))
+
+
+
+CUSTOM_QCFG = torch.quantization.QConfig(
+    activation=torch.quantization.FakeQuantize.with_args(
+        observer=torch.quantization.observer.MovingAverageMinMaxObserver,
+        quant_min=0,
+        quant_max=255,
+        dtype=torch.quint8,
+        qscheme=torch.per_tensor_affine
+    ),
+    weight=torch.quantization.FakeQuantize.with_args(
+        observer=torch.quantization.observer.MovingAverageMinMaxObserver,
+        quant_min=-128,
+        quant_max=127,
+        dtype=torch.qint8,
+        qscheme=torch.per_tensor_symmetric
+    )
+)
+
+
+EMA=False
 
 class BaseTrainer:
     """
@@ -297,7 +622,8 @@ class BaseTrainer:
             self.validator = self.get_validator()
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
-            self.ema = ModelEMA(self.model)
+            if EMA:
+                self.ema = ModelEMA(self.model)
             if self.args.plots:
                 self.plot_training_labels()
 
@@ -343,6 +669,38 @@ class BaseTrainer:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
         epoch = self.start_epoch
+        """PTQ START"""
+        if not EMA:
+            self.model.eval()
+            self.model.fuse()
+            self.model.train()
+            self.model.model.qconfig = CUSTOM_QCFG
+            print(self.model.model.qconfig)
+            torch.quantization.prepare_qat(self.model.model, inplace=True)
+            self.model.model.apply(torch.quantization.disable_fake_quant)
+            self.model.model.apply(torch.quantization.enable_observer)
+            self.model.eval()
+            self.train_loader.dataset.mosaic = False
+            
+            pbar = TQDM(enumerate(self.train_loader), total=nb)
+            for i, batch in pbar:
+                with torch.no_grad():
+                    batch = self.preprocess_batch(batch)
+                    self.model(batch)
+            print("Calibration done")
+            self.train_loader.dataset.mosaic = True
+            self.model.model.apply(torch.quantization.enable_fake_quant)
+            self.model.model.apply(torch.quantization.disable_observer)
+            torch.save(self.model.model.state_dict(), 'ptq%s.pt'%datetime.now().strftime("%Y%m%d"))
+            self.model.train()
+        
+        """
+        yolo detect train data=acr27_dev.yaml model=yolov10_dev_alcor_vdet.yaml epochs=30 batch=64 imgsz=320 device=1 amp=False model=/home/kylai/llm/yolov10/runs/detect/train200/weights/best.pt optimizer=AdamW lr0=0.001 cos_lr classes=0
+        yolo val data=acr27_dev.yaml model=yolov10_dev_alcor_vdet.yaml batch=128 imgsz=320 device=cpu classes=0 model=/home/kylai/llm/yolov10/runs/detect/train200/weights/best.pt
+
+        yolo detect train data=coco_dev.yaml model=yolov10_dev_alcor_vdet.yaml epochs=30 batch=64 imgsz=320 device=1 amp=False model=/home/kylai/llm/yolov10/runs/detect/train200/weights/best.pt optimizer=AdamW lr0=0.001 cos_lr classes=0
+        yolo val data=coco_dev.yaml model=yolov10_dev_alcor_vdet.yaml batch=128 imgsz=320 device=cpu classes=0 model=/home/kylai/llm/yolov10/runs/detect/train177/weights/best.pt
+        """
         while True:
             self.epoch = epoch
             self.run_callbacks("on_train_epoch_start")
@@ -422,7 +780,8 @@ class BaseTrainer:
             self.run_callbacks("on_train_epoch_end")
             if RANK in (-1, 0):
                 final_epoch = epoch + 1 == self.epochs
-                self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
+                if EMA:
+                    self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
                 # Validation
                 if (self.args.val and (((epoch+1) % self.args.val_period == 0) or (self.epochs - epoch) <= 10)) \
@@ -435,7 +794,10 @@ class BaseTrainer:
 
                 # Save model
                 if self.args.save or final_epoch:
-                    self.save_model()
+                    if EMA:
+                        self.save_model()
+                    else:
+                        torch.save(self.model.model.state_dict(), 'qat%s.pt'%datetime.now().strftime("%Y%m%d"))
                     self.run_callbacks("on_model_save")
 
             # Scheduler
@@ -486,8 +848,8 @@ class BaseTrainer:
             "epoch": self.epoch,
             "best_fitness": self.best_fitness,
             "model": deepcopy(de_parallel(self.model)).half(),
-            "ema": deepcopy(self.ema.ema).half(),
-            "updates": self.ema.updates,
+            #"ema": deepcopy(self.ema.ema).half(),
+            #"updates": self.ema.updates,
             "optimizer": self.optimizer.state_dict(),
             "train_args": vars(self.args),  # save as dict
             "train_metrics": metrics,

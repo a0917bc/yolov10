@@ -1,0 +1,3 @@
+yolo detect train data=coco.yaml model=yolov10_dev_alcor_vdet.yaml epochs=300 batch=64 imgsz=320 device=0 amp=False classes=0,1,2,3
+yolo detect train data=coco.yaml model=yolov10_dev_alcor_vdet.yaml epochs=300 batch=64 imgsz=320 device=0 amp=False classes=0,1,2,3,4,5,6,7
+yolo detect train data=coco.yaml model=yolov10_dev_alcor_vdet.yaml epochs=300 batch=64 imgsz=320 device=0 amp=False classes=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15

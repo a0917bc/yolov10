@@ -257,6 +257,7 @@ def model_info(model, detailed=False, verbose=True, imgsz=640):
     yaml_file = getattr(model, "yaml_file", "") or getattr(model, "yaml", {}).get("yaml_file", "")
     model_name = Path(yaml_file).stem.replace("yolo", "YOLO") or "Model"
     LOGGER.info(f"{model_name} summary{fused}: {n_l} layers, {n_p} parameters, {n_g} gradients{fs}")
+    #print(model)
     return n_l, n_p, n_g, flops
 
 
@@ -300,6 +301,7 @@ def model_info_for_loggers(trainer):
 
 def get_flops(model, imgsz=640):
     """Return a YOLO model's FLOPs."""
+    imgsz=320
     if not thop:
         return 0.0  # if not installed return 0.0 GFLOPs
 
@@ -318,7 +320,7 @@ def get_flops(model, imgsz=640):
         except Exception:
             # Use actual image size for input tensor (i.e. required for RTDETR models)
             im = torch.empty((1, p.shape[1], *imgsz), device=p.device)  # input image in BCHW format
-            return thop.profile(deepcopy(model), inputs=[im], verbose=False)[0] / 1e9 * 2  # imgsz GFLOPs
+            return thop.profile(deepcopy(model), inputs=[im], verbose=False)[0] #/ 1e9 * 2  # imgsz GFLOPs
     except Exception:
         return 0.0
 

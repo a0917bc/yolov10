@@ -43,7 +43,7 @@ class DetectionValidator(BaseValidator):
     def preprocess(self, batch):
         """Preprocesses batch of images for YOLO training."""
         batch["img"] = batch["img"].to(self.device, non_blocking=True)
-        batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 255
+        batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 256 #$%@
         for k in ["batch_idx", "cls", "bboxes"]:
             batch[k] = batch[k].to(self.device)
 
@@ -266,7 +266,7 @@ class DetectionValidator(BaseValidator):
             self.jdict.append(
                 {
                     "image_id": image_id,
-                    "category_id": self.class_map[int(p[5])],
+                    "category_id": self.class_map[int(p[5])]+1,
                     "bbox": [round(x, 3) for x in b],
                     "score": round(p[4], 5),
                 }
