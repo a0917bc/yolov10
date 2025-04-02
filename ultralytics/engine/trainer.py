@@ -49,6 +49,7 @@ from ultralytics.utils.torch_utils import (
     strip_optimizer,
 )
 from datetime import datetime
+from ultralytics.utils.iris_overview import evaluate, IRIS, del_one2many_wgt
 
 class LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
     r"""This is an extension of the FakeQuantize module in fake_quantize.py, which
@@ -365,8 +366,8 @@ CUSTOM_QCFG = torch.quantization.QConfig(
     ),
     weight=torch.quantization.FakeQuantize.with_args(
         observer=torch.quantization.observer.MovingAverageMinMaxObserver,
-        quant_min=-128,
-        quant_max=127,
+        quant_min=-64,
+        quant_max=63,
         dtype=torch.qint8,
         qscheme=torch.per_tensor_symmetric
     )
@@ -487,6 +488,9 @@ class BaseTrainer:
         if RANK in (-1, 0):
             callbacks.add_integration_callbacks(self)
 
+        # self.add_callback("on_train_epoch_end", pruning_callback)
+        # self.mask = {}
+        # self.add_callback("on_train_epoch_end", bin_regularization)
     def add_callback(self, event: str, callback):
         """Appends the given callback."""
         self.callbacks[event].append(callback)
@@ -577,6 +581,7 @@ class BaseTrainer:
         )
         always_freeze_names = [".dfl"]  # always freeze these layers
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
+        #freeze_layer_names = [f"model.{x}." for x in [i for i in range(11)]]
         for k, v in self.model.named_parameters():
             # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
             if any(x in k for x in freeze_layer_names):
@@ -598,7 +603,8 @@ class BaseTrainer:
         if RANK > -1 and world_size > 1:  # DDP
             dist.broadcast(self.amp, src=0)  # broadcast the tensor from rank 0 to all other ranks (returns None)
         self.amp = bool(self.amp)  # as boolean
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
+        # self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.amp)
         if world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK])
 
@@ -622,7 +628,7 @@ class BaseTrainer:
             self.validator = self.get_validator()
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
-            if EMA:
+            if self.args.seed != 7414:
                 self.ema = ModelEMA(self.model)
             if self.args.plots:
                 self.plot_training_labels()
@@ -645,6 +651,12 @@ class BaseTrainer:
         self.resume_training(ckpt)
         self.scheduler.last_epoch = self.start_epoch - 1  # do not move
         self.run_callbacks("on_pretrain_routine_end")
+
+    def l1norm(self, layer):
+        return layer.weight.data.abs().detach().sum(axis=(1, 2, 3))
+    
+    def iqr(self, layer):
+        return torch.quantile(layer.weight, 0.75) - torch.quantile(layer.weight, 0.25)
 
     def _do_train(self, world_size=1):
         """Train completed, evaluate and plot if specified by arguments."""
@@ -669,13 +681,51 @@ class BaseTrainer:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
         epoch = self.start_epoch
+        ptname = '%s.pt'%datetime.now().strftime("%Y%m%d%H%M%S")
+        if False:
+            acrwgt = torch.load('/home/kylai/llm/athena/trained_model/acer/PyTorch_v1.5.0/ACR/v2.6/ckp_ACR2.6_F32.pth', map_location=torch.device('cpu'))['state_dict']
+            from collections import OrderedDict
+            dwt = OrderedDict()
+            for n in acrwgt:
+                newn = n.replace('features.', '').replace('classifier.1', '17.classifier')
+                if newn.startswith('0.'):
+                    newn = newn.replace('0.1', '0.2').replace('0.0', '0.1')
+                if newn == '0.1.weight':
+                    temp_wgt = torch.zeros((16, 2, 3, 3), dtype=acrwgt[n].dtype)
+                    temp_wgt[:, 0, ...] = acrwgt[n].squeeze(1)
+                    dwt[newn] = temp_wgt
+                else:
+                    dwt[newn] = acrwgt[n]
+            
+            self.model.model.load_state_dict(dwt, strict=False)
+            print('load done')
+        if False:
+            freeze_layer_names = [f"model.{x}." for x in [i for i in range(11)]]
+            ln = 0
+            for k, v in self.model.named_parameters():
+                if any(x in k for x in freeze_layer_names):
+                    ln += 1
+                    v.requires_grad = False
+            print('freeze', ln)
         """PTQ START"""
-        if not EMA:
+        if self.args.seed == 7414:
+            #cv2 = copy.deepcopy(self.model.model[-1].cv2)
+            #cv3 = copy.deepcopy(self.model.model[-1].cv3)
+
             self.model.eval()
             self.model.fuse()
             self.model.train()
             self.model.model.qconfig = CUSTOM_QCFG
+            """
+            for m in self.model.model.modules():
+                if isinstance(m, nn.Conv2d):
+                    if self.iqr(m).item() < 1:
+
+                    #if sum(self.l1norm(m).tolist()) < 300:
+                        m.qconfig = create_qcfg(w=4, a=8)
+            """
             print(self.model.model.qconfig)
+            #self.model.model[-1].quantflag = True
             torch.quantization.prepare_qat(self.model.model, inplace=True)
             self.model.model.apply(torch.quantization.disable_fake_quant)
             self.model.model.apply(torch.quantization.enable_observer)
@@ -691,7 +741,12 @@ class BaseTrainer:
             self.train_loader.dataset.mosaic = True
             self.model.model.apply(torch.quantization.enable_fake_quant)
             self.model.model.apply(torch.quantization.disable_observer)
-            torch.save(self.model.model.state_dict(), 'ptq%s.pt'%datetime.now().strftime("%Y%m%d"))
+
+            #self.model.model[-1].cv2 = cv2
+            #self.model.model[-1].cv3 = cv3
+            #self.model.model[-1].quantflag = False
+            # torch.save(self.model.model.state_dict(), 'ptq'+ptname)
+            torch.save(self.model.model.state_dict(), self.wdir / f"ptq{ptname}")
             self.model.train()
         
         """
@@ -742,6 +797,16 @@ class BaseTrainer:
                     self.tloss = (
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
+                # if epoch > 75:
+                #     total_br_loss = 0
+                #     for name, module in self.model.model.named_modules():
+                #         if hasattr(module, 'weight_fake_quant'):
+                #             # print(f"{name} has weight_fake_quant")
+                #             # print(f"and its scale: {module.weight_fake_quant.scale}")
+                #             v = module.weight
+                #             # total_br_loss += bin_regularization_loss(v, v_hat, v_int, num_bits)
+                #             total_br_loss += bin_regularization_loss_vectorized(v)
+                #     self.loss += total_br_loss
 
                 # Backward
                 self.scaler.scale(self.loss).backward()
@@ -780,24 +845,38 @@ class BaseTrainer:
             self.run_callbacks("on_train_epoch_end")
             if RANK in (-1, 0):
                 final_epoch = epoch + 1 == self.epochs
-                if EMA:
+                if self.args.seed != 7414:
                     self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
+
+                torch.save(self.model.model.state_dict(), self.wdir / f"ForCls.pt")
+                model = IRIS(conf=0)
+                wgt = torch.load(self.wdir / f"ForCls.pt", map_location=torch.device('cpu'))
+                wgt = del_one2many_wgt(wgt)
+                model.load_state_dict(wgt, strict=True)
+                model.to(self.device)
+                test_loss, top1_acc = evaluate(model, self.device)
 
                 # Validation
                 if (self.args.val and (((epoch+1) % self.args.val_period == 0) or (self.epochs - epoch) <= 10)) \
                     or final_epoch or self.stopper.possible_stop or self.stop:
                     self.metrics, self.fitness = self.validate()
+                    self.metrics["metrics/classification_loss"] = test_loss
+                    self.metrics["metrics/top1_acc"] = top1_acc
+
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
 
                 # Save model
+                if self.args.seed == 7414:
+                    # torch.save(self.model.model.state_dict(), 'qat'+ptname)
+                    torch.save(self.model.model.state_dict(), self.wdir / f"qat{ptname}")
                 if self.args.save or final_epoch:
-                    if EMA:
+                    if self.args.seed != 7414:
                         self.save_model()
-                    else:
-                        torch.save(self.model.model.state_dict(), 'qat%s.pt'%datetime.now().strftime("%Y%m%d"))
+                    # else:
+                        # torch.save(self.model.model.state_dict(), 'qat_last'+ptname)
                     self.run_callbacks("on_model_save")
 
             # Scheduler
