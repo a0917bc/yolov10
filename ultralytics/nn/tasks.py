@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from ultralytics.nn.modules.dev import InvertedResidual, conv_3x3_bn, conv_1x1_bn, ConvBNReLU, InvertedResidualalcor, Graystem
-from ultralytics.nn.modules.egis_dev import GatedCNNBlock, DWStemLayer, DWDownsampleLayer, DWConvbnrelu, DWgrayStemLayer
+from ultralytics.nn.modules.egis_dev import GatedCNNBlock, DWStemLayer, DWDownsampleLayer, DWConvbnrelu, DWgrayStemLayer, ConvFormer
 from ultralytics.nn.modules import (
     AIFI,
     C1,
@@ -55,7 +55,11 @@ from ultralytics.nn.modules import (
     SCDown,
     RepVGGDW,
     v10Detect,
-    EgisDetect
+    EgisDetect,
+    EgisDetect2,
+    EgisDetect3,
+    Dumbhead,
+    TransConv
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -77,7 +81,7 @@ try:
 except ImportError:
     thop = None
 
-DEV=(GatedCNNBlock, DWStemLayer, DWDownsampleLayer, DWConvbnrelu, InvertedResidual, conv_3x3_bn, conv_1x1_bn, ConvBNReLU, InvertedResidualalcor, DWgrayStemLayer, Graystem)
+DEV=(GatedCNNBlock, DWStemLayer, DWDownsampleLayer, DWConvbnrelu, InvertedResidual, conv_3x3_bn, conv_1x1_bn, ConvBNReLU, InvertedResidualalcor, DWgrayStemLayer, Graystem, TransConv, ConvFormer)
 
 
 class BaseModel(nn.Module):
@@ -187,7 +191,7 @@ class BaseModel(nn.Module):
         """
         if not self.is_fused():
             for m in self.model.modules():
-                if isinstance(m, (Conv, Conv2, DWConv, GatedCNNBlock)) and hasattr(m, "bn"):
+                if isinstance(m, (Conv, Conv2, DWConv, GatedCNNBlock, ConvFormer)) and hasattr(m, "bn"):
                     if isinstance(m, Conv2):
                         m.fuse_convs()
                     m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
@@ -230,6 +234,12 @@ class BaseModel(nn.Module):
                     if len(m) == 4:
                         m[1] = fuse_conv_and_bn(m[1], m[2])
                         del m[2]"""
+                if isinstance(m, torch.nn.Sequential) and isinstance(m[0], torch.nn.Linear) and len(m) == 3:
+                    torch.ao.quantization.fuse_modules_qat(m, ['0', '1'], inplace=True)
+                if isinstance(m, ConvFormer):
+                    torch.ao.quantization.fuse_modules_qat(m.convbn, ['0', '1'], inplace=True)
+                    torch.ao.quantization.fuse_modules_qat(m.convbnrelu, ['0', '1'], inplace=True)
+                    #torch.ao.quantization.fuse_modules_qat(m.convbnrelu, ['2', '3'], inplace=True)
                 if isinstance(m, (DWStemLayer, DWgrayStemLayer)):
                     if isinstance(m.norm1, nn.BatchNorm2d):
                         m.conv1[-1] = fuse_conv_and_bn(m.conv1[-1], m.norm1)
@@ -363,7 +373,7 @@ class DetectionModel(BaseModel):
             s = 256  # 2x min stride
             m.inplace = self.inplace
             forward = lambda x: self.forward(x)[0] if isinstance(m, (Segment, Pose, OBB)) else self.forward(x)
-            if isinstance(m, (v10Detect, EgisDetect)):
+            if isinstance(m, (v10Detect, EgisDetect, EgisDetect2, EgisDetect3)):
                 forward = lambda x: self.forward(x)["one2many"]
             m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
             self.stride = m.stride
@@ -491,7 +501,7 @@ class ClassificationModel(BaseModel):
     def reshape_outputs(model, nc):
         """Update a TorchVision classification model to class count 'n' if required."""
         name, m = list((model.model if hasattr(model, "model") else model).named_children())[-1]  # last module
-        if isinstance(m, Classify):  # YOLO Classify() head
+        if isinstance(m, Classify, Dumbhead):  # YOLO Classify() head
             if m.linear.out_features != nc:
                 m.linear = nn.Linear(m.linear.in_features, nc)
         elif isinstance(m, nn.Linear):  # ResNet, EfficientNet
@@ -980,7 +990,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect, EgisDetect}:
+        elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect, EgisDetect, EgisDetect2, EgisDetect3, Dumbhead}:
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
@@ -1072,7 +1082,7 @@ def guess_model_task(model):
         m = cfg["head"][-1][-2].lower()  # output module name
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
-        if m == "detect" or m == "v10detect" or m=="egisdetect":
+        if m == "detect" or m == "v10detect" or m=="egisdetect" or m == "egisdetect2" or m == "egisdetect3":
             return "detect"
         if m == "segment":
             return "segment"
@@ -1098,13 +1108,13 @@ def guess_model_task(model):
         for m in model.modules():
             if isinstance(m, Segment):
                 return "segment"
-            elif isinstance(m, Classify):
+            elif isinstance(m, Classify, Dumbhead):
                 return "classify"
             elif isinstance(m, Pose):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
-            elif isinstance(m, (Detect, WorldDetect, v10Detect, EgisDetect)):
+            elif isinstance(m, (Detect, WorldDetect, v10Detect, EgisDetect, EgisDetect2, EgisDetect3)):
                 return "detect"
 
     # Guess from model filename

@@ -850,11 +850,22 @@ class BaseTrainer:
 
                 torch.save(self.model.model.state_dict(), self.wdir / f"ForCls.pt")
                 model = IRIS(conf=0)
+                
+                if self.args.seed == 7414:
+                    model.fuse()
+                    model.train()
+                    model.qconfig = CUSTOM_QCFG
+                    torch.quantization.prepare_qat(model, inplace=True)
+                    model.apply(torch.quantization.enable_fake_quant)
+                    model.apply(torch.quantization.disable_observer)
+                
                 wgt = torch.load(self.wdir / f"ForCls.pt", map_location=torch.device('cpu'))
-                wgt = del_one2many_wgt(wgt)
-                model.load_state_dict(wgt, strict=True)
+                model.load_state_dict(wgt, strict=False)
                 model.to(self.device)
                 test_loss, top1_acc = evaluate(model, self.device)
+                if top1_acc > self.best_top1_acc:
+                    self.best_top1_acc = top1_acc
+                    torch.save(self.model.model.state_dict(), self.wdir / f"BestForCls.pt")
 
                 # Validation
                 if (self.args.val and (((epoch+1) % self.args.val_period == 0) or (self.epochs - epoch) <= 10)) \

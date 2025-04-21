@@ -727,7 +727,20 @@ class v10DetectLoss:
         loss_one2many = self.one2many(one2many, batch)
         one2one = preds["one2one"]
         loss_one2one = self.one2one(one2one, batch)
-        return loss_one2many[0] + loss_one2one[0], torch.cat((loss_one2many[1], loss_one2one[1]))
+        # return loss_one2many[0] + loss_one2one[0], torch.cat((loss_one2many[1], loss_one2one[1]))
+        """"""
+        
+        if "classification" in preds and batch["classification"] is not None:
+            # import pdb;pdb.set_trace()
+            classification = preds["classification"]
+            loss = torch.nn.functional.cross_entropy(classification, batch["classification"].long().to(classification.device), reduction="mean")
+        else:
+            loss = torch.tensor(0, device=loss_one2one[0].device)
+        loss = loss * self.one2many.hyp.pose
+        loss_items = loss.detach().unsqueeze(0)
+        # print(loss_one2many[1], loss_one2one[1], loss_items)
+        return loss_one2many[0] + loss_one2one[0] + loss, torch.cat((loss_one2many[1], loss_one2one[1], loss_items))
+        
 
 class v10PoseLoss:
     def __init__(self, model):
