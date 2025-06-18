@@ -66,7 +66,7 @@ from .conv import (
     RepConv,
     SpatialAttention,
 )
-from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect, EgisDetect
+from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect, EgisDetect, EgisDetect2, EgisDetect3, TransConv, Dumbhead
 from .transformer import (
     AIFI,
     MLP,
@@ -144,5 +144,9 @@ __all__ = (
     "SCDown",
     "RepVGGDW",
     "v10Detect",
-    "EgisDetect"
+    "EgisDetect",
+    "EgisDetect2",
+    "EgisDetect3",
+    "TransConv",
+    "Dumbhead"
 )

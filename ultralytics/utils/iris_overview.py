@@ -317,20 +317,7 @@ class EgisDetect2(nn.Module):
         kernel_size = 3
         ch_lmt = 64
         ch = [24]
-        self.cv3 = nn.ModuleList(
-            nn.Sequential(
-                DWConvbnrelu(x, ch_lmt, kernel_size),
-                DWConvbnrelu(ch_lmt, ch_lmt, kernel_size), 
-                nn.Conv2d(ch_lmt, nc, 1)
-            ) for x in ch
-        )
-        self.cv2 = nn.ModuleList(
-            nn.Sequential(
-                DWConvbnrelu(x, ch_lmt, kernel_size),
-                DWConvbnrelu(ch_lmt, ch_lmt, kernel_size), 
-                nn.Conv2d(ch_lmt, 4 * self.regression, 1)
-            ) for x in ch
-        )
+
         self.one2one_cv2 = nn.ModuleList(
             nn.Sequential(
                 DWConvbnrelu(x, ch_lmt, kernel_size),
@@ -516,14 +503,12 @@ def webcam_demo(model, device, fbf, slow):
 
 
 def test(model, device, test_loader):
-    old_training_state = model.training
     model.eval()
     test_loss = 0
     correct = 0
     lossLayer = torch.nn.CrossEntropyLoss(reduction='sum')
     for data, target in tqdm.tqdm(test_loader):
         data, target = data.to(device), target.to(device)
-        # import pdb;pdb.set_trace()
         with torch.no_grad():
             output = model(data)
         test_loss += lossLayer(output, target).item()
@@ -531,21 +516,15 @@ def test(model, device, test_loader):
         correct += pred.eq(target.view_as(pred)).sum().item()
 
     test_loss /= len(test_loader.dataset)
-    model.train(old_training_state)
-    print(
-        '\nTest set: Average loss: {:.4f}, Accuracy: {:.3f}%\n'.format(
-            test_loss, 100.0 * correct / len(test_loader.dataset)
-        )
-    )
+    top1_acc = 100.0 * correct / len(test_loader.dataset)
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {:.3f}%\n'.format(test_loss, top1_acc))
+    return test_loss, top1_acc
 
 
 def evaluate(model, device):
-    from dataloader import create_loader
-    from distribution import get_rank, get_world_size
+    from ultralytics.utils.dataloader import create_loader
+    from ultralytics.utils.distribution import get_rank, get_world_size
     import os
-    # Iterate people directories
-    # datasets/acer_test/EddieTan, datasets/acer_test/Effie, datasets/acer_test/Enlin, datasets/acer_test/James, ...
-    # datasets_folder = 'datasets/ACR/v2.7/' # 
     datasets_folder = 'datasets/acer_test/'
     for person_dir in os.listdir(datasets_folder):
         if person_dir == 'train':
@@ -569,6 +548,24 @@ def evaluate(model, device):
             paste_root=None,
         )
         test(model, device, data_loader_val)
+    data_loader_val = create_loader(
+        data_root=['datasets/ACR/v2.7/val'],
+        mono=True,
+        train='val',
+        num_tasks=get_world_size(),
+        rank=get_rank(),
+        batch_size=128,
+        num_workers=12,
+        jlist=None,
+        root_j=None,
+        auto_augment=False,
+        rotation=False,
+        val_size=[120, 160],
+        dataset_type="default",
+        paste_root=None,
+    )
+    return test(model, device, data_loader_val)
+    
 
 
 if __name__ == "__main__":
@@ -587,28 +584,24 @@ if __name__ == "__main__":
     args = parser.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = IRIS(conf=0)
-    from alcornet import AlcorNetV1
-    # model = AlcorNetV1()
-    
+
     if args.q:
         model.fuse()
         model.train()
         model.qconfig = CUSTOM_QCFG
         torch.quantization.prepare_qat(model, inplace=True)
-        model.apply(torch.quantization.enable_fake_quant)
-        model.apply(torch.quantization.disable_observer)
 
     wgt = torch.load(args.wgt, map_location=torch.device('cpu'))
-    # if args.wgt_type:
-    #     wgt = wgt['model'].model.state_dict()
-    # else:
-    #     wgt = wgt['state_dict']
-    import pdb;pdb.set_trace() #
+    if args.wgt_type:
+        wgt = wgt['model'].model.state_dict()
+
+    # model.load_state_dict(wgt, strict=True)
+    wgt = del_one2many_wgt(wgt)
     model.load_state_dict(wgt, strict=True)
 
-    # if args.q:
-    #     model.eval()
-    #     torch.quantization.convert(model, inplace=True)
+    if args.q:
+        model.eval()
+        torch.quantization.convert(model, inplace=True)
 
     model.to(device)
     print("Use device: ", device)
