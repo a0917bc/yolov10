@@ -169,6 +169,14 @@ class BaseValidator:
         bar = TQDM(self.dataloader, desc=self.get_desc(), total=len(self.dataloader))
         self.init_metrics(de_parallel(model))
         self.jdict = []  # empty before each val
+        ###############################################################################################################################
+        import os
+        import sys
+        sys.path.append(os.path.abspath('.'))
+        from IRIS.tools.single_compare import setup_cmodel_iris, cmodel_iris_inference, convert_detections_for_draw
+        from IRIS.tools.iris_overview import create_qmodel
+        model = create_qmodel(None, torch.device("cpu"), "/home/trivenzhou/yolov10_250321/0416IRIS/train/weights/qat20250430173617.pt")
+        ###############################################################################################################################
         for batch_i, batch in enumerate(bar):
             self.run_callbacks("on_val_batch_start")
             self.batch_i = batch_i
@@ -178,17 +186,29 @@ class BaseValidator:
 
             # Inference
             with dt[1]:
-                preds = model(batch["img"], augment=augment)
+                # preds = model(batch["img"], augment=augment)
+                preds_q = model(batch["img"])
+                preds = preds_q[1][0].T.unsqueeze(0) # torch.Size([1, 2, 6])
+                
+                # img_float = batch["img"].squeeze(0).squeeze(0)
+                # cls_buf, iris_out_buf, det_buf, zp, scl = setup_cmodel_iris()
+                # cmodel_iris_inference(img_float, cls_buf, iris_out_buf, det_buf, zp, scl)
+                # c_detections = convert_detections_for_draw(det_buf)
+                # preds_c = c_detections[0].T.unsqueeze(0) # torch.Size([1, 2, 6])
+                # input: Tensor -> np.array, output: np.array -> 1dict_keys(['one2many', 'one2one', 'classification'])
 
+                # import pdb; pdb.set_trace()
             # Loss
             with dt[2]:
                 if self.training:
                     self.loss += model.loss(batch, preds)[1]
 
             # Postprocess
-            with dt[3]:
-                preds = self.postprocess(preds)
-
+            # with dt[3]:
+            #     preds = self.postprocess(preds)
+        
+            # import pdb; pdb.set_trace()
+            
             self.update_metrics(preds, batch)
             if self.args.plots and batch_i < 3:
                 self.plot_val_samples(batch, batch_i)

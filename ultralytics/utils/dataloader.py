@@ -209,7 +209,6 @@ def build_transform(size, train_type, auto_aug, rotation, mono):
             del transform.transforms[2].ops[-2]
             
         else:
-            # TODO Write a config-like flow to control the augmentation 
             transform_list = [
                 transforms.Grayscale(),
                 transforms.RandomOrder([
